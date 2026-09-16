@@ -1,0 +1,498 @@
+(function() {
+  "use strict";
+
+  // ---------- Persistent best score (per-viewer convenience only) ----------
+  function getBest() {
+    try {
+      const v = localStorage.getItem('turboDrift3D_best');
+      return v ? parseInt(v, 10) : 0;
+    } catch (e) { return 0; }
+  }
+  function setBest(v) {
+    try { localStorage.setItem('turboDrift3D_best', String(v)); } catch (e) {}
+  }
+
+  // ---------- Difficulty presets ----------
+  const DIFFICULTIES = {
+    easy:       { baseSpeed: 0.32, speedPerLevel: 0.045, baseSpawn: 68, spawnDecay: 3.2, minSpawn: 26, roadWidth: 11, widthShrinkPerLevel: 0.18, minWidth: 7.5, scorePerLevel: 12, lives: 4 },
+    normal:     { baseSpeed: 0.42, speedPerLevel: 0.065, baseSpawn: 56, spawnDecay: 3.6, minSpawn: 20, roadWidth: 10, widthShrinkPerLevel: 0.26, minWidth: 6.4, scorePerLevel: 14, lives: 3 },
+    hard:       { baseSpeed: 0.55, speedPerLevel: 0.085, baseSpawn: 46, spawnDecay: 4.0, minSpawn: 16, roadWidth: 9,  widthShrinkPerLevel: 0.34, minWidth: 5.6, scorePerLevel: 16, lives: 3 },
+    fantastic:  { baseSpeed: 0.68, speedPerLevel: 0.11,  baseSpawn: 38, spawnDecay: 4.6, minSpawn: 13, roadWidth: 8.4,widthShrinkPerLevel: 0.42, minWidth: 5.0, scorePerLevel: 18, lives: 2 }
+  };
+  let currentDiffKey = 'normal';
+  let DIFF = DIFFICULTIES[currentDiffKey];
+
+  // ---------- Three.js scene setup ----------
+  const container = document.getElementById('game-container');
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x0b0f1a);
+  scene.fog = new THREE.Fog(0x0b0f1a, 30, 140);
+
+  const camera = new THREE.PerspectiveCamera(62, window.innerWidth / window.innerHeight, 0.1, 300);
+  camera.position.set(0, 7.2, 11.5);
+  camera.lookAt(0, 0, -14);
+
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.shadowMap.enabled = true;
+  container.appendChild(renderer.domElement);
+
+  // Lights
+  const hemi = new THREE.HemisphereLight(0x9fc8ff, 0x1a1420, 0.85);
+  scene.add(hemi);
+  const dir = new THREE.DirectionalLight(0xffffff, 0.9);
+  dir.position.set(-8, 20, 10);
+  dir.castShadow = true;
+  dir.shadow.mapSize.set(1024, 1024);
+  dir.shadow.camera.left = -20; dir.shadow.camera.right = 20;
+  dir.shadow.camera.top = 20; dir.shadow.camera.bottom = -20;
+  scene.add(dir);
+
+  // ---------- Ground / terrain (sides) ----------
+  const groundGeo = new THREE.PlaneGeometry(400, 400);
+  const groundMat = new THREE.MeshStandardMaterial({ color: 0x14351f, roughness: 1 });
+  const ground = new THREE.Mesh(groundGeo, groundMat);
+  ground.rotation.x = -Math.PI / 2;
+  ground.position.y = -0.05;
+  ground.receiveShadow = true;
+  scene.add(ground);
+
+  // ---------- Road (segments recycled for infinite scroll) ----------
+  const roadGroup = new THREE.Group();
+  scene.add(roadGroup);
+  const SEGMENT_LEN = 20;
+  const NUM_SEGMENTS = 10;
+  const roadSegments = [];
+  const roadMat = new THREE.MeshStandardMaterial({ color: 0x2b2f3a, roughness: 0.9 });
+  const stripeMat = new THREE.MeshStandardMaterial({ color: 0xffe27a, emissive: 0x332a10 });
+  const edgeMat = new THREE.MeshStandardMaterial({ color: 0xff5a5f, emissive: 0x330a0b });
+
+  function buildRoadSegment(zPos, width) {
+    const g = new THREE.Group();
+    const roadMesh = new THREE.Mesh(new THREE.PlaneGeometry(width, SEGMENT_LEN), roadMat);
+    roadMesh.rotation.x = -Math.PI / 2;
+    roadMesh.receiveShadow = true;
+    g.add(roadMesh);
+
+    // center dashed stripes (two lane dividers for 3-lane feel)
+    for (let lane = -1; lane <= 1; lane += 2) {
+      const stripe = new THREE.Mesh(new THREE.PlaneGeometry(0.18, SEGMENT_LEN * 0.5), stripeMat);
+      stripe.rotation.x = -Math.PI / 2;
+      stripe.position.set(lane * width / 6, 0.01, 0);
+      g.add(stripe);
+    }
+    // edges
+    const edgeL = new THREE.Mesh(new THREE.BoxGeometry(0.25, 0.22, SEGMENT_LEN), edgeMat);
+    edgeL.position.set(-width / 2, 0.1, 0);
+    edgeL.castShadow = true;
+    const edgeR = edgeL.clone();
+    edgeR.position.x = width / 2;
+    g.add(edgeL, edgeR);
+
+    g.position.z = zPos;
+    g.userData.width = width;
+    roadGroup.add(g);
+    return g;
+  }
+
+  function resetRoad(width) {
+    roadSegments.forEach(s => roadGroup.remove(s));
+    roadSegments.length = 0;
+    for (let i = 0; i < NUM_SEGMENTS; i++) {
+      roadSegments.push(buildRoadSegment(-i * SEGMENT_LEN, width));
+    }
+  }
+
+  // ---------- Player / traffic car builder ----------
+  function buildCar(bodyColor, scale) {
+    const g = new THREE.Group();
+    const bodyMat = new THREE.MeshStandardMaterial({ color: bodyColor, metalness: 0.4, roughness: 0.35 });
+    const body = new THREE.Mesh(new THREE.BoxGeometry(1.9, 0.55, 3.6), bodyMat);
+    body.position.y = 0.5;
+    body.castShadow = true;
+    g.add(body);
+
+    const cabinMat = new THREE.MeshStandardMaterial({ color: 0x1a2333, metalness: 0.2, roughness: 0.2 });
+    const cabin = new THREE.Mesh(new THREE.BoxGeometry(1.4, 0.5, 1.7), cabinMat);
+    cabin.position.set(0, 0.98, -0.1);
+    cabin.castShadow = true;
+    g.add(cabin);
+
+    const wheelGeo = new THREE.CylinderGeometry(0.36, 0.36, 0.34, 14);
+    const wheelMat = new THREE.MeshStandardMaterial({ color: 0x111318, roughness: 0.8 });
+    const wheelPositions = [
+      [-1.02, 0.36, 1.15], [1.02, 0.36, 1.15],
+      [-1.02, 0.36, -1.15], [1.02, 0.36, -1.15]
+    ];
+    wheelPositions.forEach(p => {
+      const w = new THREE.Mesh(wheelGeo, wheelMat);
+      w.rotation.z = Math.PI / 2;
+      w.position.set(p[0], p[1], p[2]);
+      w.castShadow = true;
+      g.add(w);
+    });
+
+    // headlights / taillights
+    const lightMat = new THREE.MeshStandardMaterial({ color: 0xfff4c2, emissive: 0xfff4c2, emissiveIntensity: 0.8 });
+    const tailMat = new THREE.MeshStandardMaterial({ color: 0xff2a2a, emissive: 0xff2a2a, emissiveIntensity: 0.8 });
+    [-0.65, 0.65].forEach(x => {
+      const hl = new THREE.Mesh(new THREE.BoxGeometry(0.25, 0.14, 0.06), lightMat);
+      hl.position.set(x, 0.55, 1.82);
+      g.add(hl);
+      const tl = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.14, 0.06), tailMat);
+      tl.position.set(x, 0.55, -1.82);
+      g.add(tl);
+    });
+
+    g.scale.setScalar(scale || 1);
+    return g;
+  }
+
+  const playerCar = buildCar(0x34d4c8, 1);
+  playerCar.position.set(0, 0, 2);
+  scene.add(playerCar);
+
+  // ---------- Traffic obstacles ----------
+  const trafficColors = [0xff5a5f, 0xffd166, 0x8e7cff, 0xff9f4a, 0x6cd67e, 0xffffff];
+  const traffic = [];
+  const trafficGroup = new THREE.Group();
+  scene.add(trafficGroup);
+
+  function spawnObstacle() {
+    const color = trafficColors[Math.floor(Math.random() * trafficColors.length)];
+    const scale = 0.9 + Math.random() * 0.3;
+    const car = buildCar(color, scale);
+    const half = DIFF.roadWidth / 2 - 1.1 * scale;
+    car.position.set((Math.random() * 2 - 1) * half, 0, -140 - Math.random() * 20);
+    car.rotation.y = Math.PI; // facing player
+    trafficGroup.add(car);
+    traffic.push({ mesh: car, scale, passed: false });
+  }
+
+  // ---------- Roadside decoration (trees) recycled ----------
+  const decorGroup = new THREE.Group();
+  scene.add(decorGroup);
+  const decor = [];
+  function buildTree() {
+    const g = new THREE.Group();
+    const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.15, 0.2, 1.2, 6), new THREE.MeshStandardMaterial({ color: 0x5a3d24 }));
+    trunk.position.y = 0.6;
+    trunk.castShadow = true;
+    const leaves = new THREE.Mesh(new THREE.CylinderGeometry(0, 1.1, 2.2, 8), new THREE.MeshStandardMaterial({ color: 0x1f7a4d }));
+    leaves.position.y = 1.9;
+    leaves.castShadow = true;
+    g.add(trunk, leaves);
+    return g;
+  }
+  function resetDecor() {
+    decor.forEach(d => decorGroup.remove(d.mesh));
+    decor.length = 0;
+    for (let i = 0; i < 18; i++) {
+      [-1, 1].forEach(side => {
+        const t = buildTree();
+        const x = side * (DIFF.roadWidth / 2 + 2.5 + Math.random() * 5);
+        const z = -i * 11 + 4;
+        t.position.set(x, 0, z);
+        decorGroup.add(t);
+        decor.push({ mesh: t, side });
+      });
+    }
+  }
+
+  // ---------- Game state ----------
+  let state = {
+    running: false,
+    paused: false,
+    score: 0,
+    level: 1,
+    lives: 3,
+    carX: 0,
+    targetX: 0,
+    speed: 0,
+    spawnTimer: 0,
+    spawnInterval: 60,
+    roadWidth: 10,
+    invulnUntil: 0,
+    distanceSinceScore: 0
+  };
+
+  function initGameState() {
+    DIFF = DIFFICULTIES[currentDiffKey];
+    state.running = true;
+    state.paused = false;
+    state.score = 0;
+    state.level = 1;
+    state.lives = DIFF.lives;
+    state.carX = 0;
+    state.targetX = 0;
+    state.speed = DIFF.baseSpeed;
+    state.spawnTimer = 0;
+    state.spawnInterval = DIFF.baseSpawn;
+    state.roadWidth = DIFF.roadWidth;
+    state.invulnUntil = 0;
+    state.distanceSinceScore = 0;
+
+    traffic.forEach(t => trafficGroup.remove(t.mesh));
+    traffic.length = 0;
+    resetRoad(state.roadWidth);
+    resetDecor();
+    playerCar.position.x = 0;
+    playerCar.visible = true;
+
+    updateHUD();
+  }
+
+  function updateHUD() {
+    document.getElementById('scoreVal').textContent = Math.floor(state.score);
+    document.getElementById('levelVal').textContent = state.level;
+    document.getElementById('speedVal').textContent = Math.round(state.speed * 130);
+    document.getElementById('lives').textContent = '❤️'.repeat(Math.max(state.lives, 0)) || '💔';
+  }
+
+  function showLevelBanner(level) {
+    const banner = document.getElementById('levelBanner');
+    banner.innerHTML = 'LEVEL ' + level + '<span class="sub">Hold on tight!</span>';
+    banner.classList.add('show');
+    setTimeout(() => banner.classList.remove('show'), 1200);
+  }
+
+  function levelUp() {
+    state.level++;
+    state.speed = DIFF.baseSpeed + (state.level - 1) * DIFF.speedPerLevel;
+    state.spawnInterval = Math.max(DIFF.minSpawn, DIFF.baseSpawn - (state.level - 1) * DIFF.spawnDecay);
+    state.roadWidth = Math.max(DIFF.minWidth, DIFF.roadWidth - (state.level - 1) * DIFF.widthShrinkPerLevel);
+    resetRoad(state.roadWidth);
+    showLevelBanner(state.level);
+  }
+
+  function endGame(crashed) {
+    state.running = false;
+    const best = Math.max(getBest(), Math.floor(state.score));
+    setBest(best);
+    document.getElementById('goTitle').textContent = crashed ? '💥 Crashed Out' : '🏁 Race Over';
+    document.getElementById('finalScore').textContent = Math.floor(state.score);
+    document.getElementById('finalLevel').textContent = state.level;
+    document.getElementById('bestScore').textContent = best;
+    document.getElementById('gameOverOverlay').classList.remove('hidden');
+    document.getElementById('hud').classList.add('hidden');
+    document.getElementById('pauseBtn').classList.add('hidden');
+  }
+
+  // ---------- Input ----------
+  const keys = {};
+  window.addEventListener('keydown', (e) => {
+    if (['ArrowLeft','ArrowRight','a','A','d','D'].includes(e.key)) e.preventDefault();
+    keys[e.key] = true;
+    if (e.key === 'Escape' && state.running) togglePause();
+  });
+  window.addEventListener('keyup', (e) => { keys[e.key] = false; });
+
+  let touchLeft = false, touchRight = false;
+
+  function pollSteer() {
+    let s = 0;
+    if (keys['ArrowLeft'] || keys['a'] || keys['A']) s -= 1;
+    if (keys['ArrowRight'] || keys['d'] || keys['D']) s += 1;
+    if (touchLeft) s -= 1;
+    if (touchRight) s += 1;
+    return s;
+  }
+
+  const btnLeft = document.getElementById('btnLeft');
+  const btnRight = document.getElementById('btnRight');
+  function bindHold(el, setter) {
+    const down = (e) => { e.preventDefault(); setter(true); };
+    const up = (e) => { e.preventDefault(); setter(false); };
+    el.addEventListener('touchstart', down, { passive: false });
+    el.addEventListener('touchend', up, { passive: false });
+    el.addEventListener('touchcancel', up, { passive: false });
+    el.addEventListener('mousedown', down);
+    el.addEventListener('mouseup', up);
+    el.addEventListener('mouseleave', up);
+  }
+  bindHold(btnLeft, v => touchLeft = v);
+  bindHold(btnRight, v => touchRight = v);
+
+  // drag-to-steer on canvas
+  let dragActive = false, dragStartX = 0, dragStartCarX = 0;
+  renderer.domElement.addEventListener('touchstart', (e) => {
+    if (!state.running || state.paused) return;
+    dragActive = true;
+    dragStartX = e.touches[0].clientX;
+    dragStartCarX = state.targetX;
+  }, { passive: true });
+  renderer.domElement.addEventListener('touchmove', (e) => {
+    if (!dragActive) return;
+    const dx = e.touches[0].clientX - dragStartX;
+    state.targetX = dragStartCarX + dx * 0.02;
+  }, { passive: true });
+  renderer.domElement.addEventListener('touchend', () => dragActive = false);
+
+  // ---------- Difficulty selection UI ----------
+  const diffButtons = document.querySelectorAll('#diffGrid .diff-btn');
+  diffButtons.forEach(btn => {
+    btn.addEventListener('click', () => {
+      diffButtons.forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      currentDiffKey = btn.dataset.key;
+    });
+  });
+
+  document.getElementById('startBtn').addEventListener('click', () => {
+    document.getElementById('startOverlay').classList.add('hidden');
+    document.getElementById('hud').classList.remove('hidden');
+    document.getElementById('pauseBtn').classList.remove('hidden');
+    initGameState();
+  });
+
+  document.getElementById('retryBtn').addEventListener('click', () => {
+    document.getElementById('gameOverOverlay').classList.add('hidden');
+    document.getElementById('hud').classList.remove('hidden');
+    document.getElementById('pauseBtn').classList.remove('hidden');
+    initGameState();
+  });
+
+  document.getElementById('changeDiffBtn').addEventListener('click', () => {
+    document.getElementById('gameOverOverlay').classList.add('hidden');
+    document.getElementById('startOverlay').classList.remove('hidden');
+  });
+
+  document.getElementById('pauseBtn').addEventListener('click', togglePause);
+  document.getElementById('resumeBtn').addEventListener('click', togglePause);
+  document.getElementById('quitBtn').addEventListener('click', () => {
+    state.running = false;
+    document.getElementById('pauseOverlay').classList.add('hidden');
+    document.getElementById('hud').classList.add('hidden');
+    document.getElementById('pauseBtn').classList.add('hidden');
+    document.getElementById('startOverlay').classList.remove('hidden');
+  });
+
+  function togglePause() {
+    if (!state.running) return;
+    state.paused = !state.paused;
+    document.getElementById('pauseOverlay').classList.toggle('hidden', !state.paused);
+  }
+
+  // ---------- Collision ----------
+  function checkCollision() {
+    const now = performance.now();
+    if (now < state.invulnUntil) return false;
+    const carHalfW = 0.85, carHalfL = 1.7;
+    for (const t of traffic) {
+      const dz = Math.abs(t.mesh.position.z - playerCar.position.z);
+      const dx = Math.abs(t.mesh.position.x - playerCar.position.x);
+      if (dz < (carHalfL + 1.6 * t.scale) && dx < (carHalfW + 0.85 * t.scale)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function handleCrash() {
+    state.lives--;
+    updateHUD();
+    if (state.lives <= 0) {
+      endGame(true);
+      return;
+    }
+    state.invulnUntil = performance.now() + 1600;
+    state.targetX = 0;
+  }
+
+  // ---------- Main loop ----------
+  const clock = new THREE.Clock();
+
+  function animate() {
+    requestAnimationFrame(animate);
+    const dt = Math.min(clock.getDelta(), 0.05);
+
+    if (state.running && !state.paused) {
+      // steering
+      const steer = pollSteer();
+      const half = state.roadWidth / 2 - 1.05;
+      state.targetX += steer * dt * 9.5;
+      state.targetX = Math.max(-half, Math.min(half, state.targetX));
+      state.carX += (state.targetX - state.carX) * Math.min(1, dt * 8);
+      playerCar.position.x = state.carX;
+      playerCar.rotation.z = (state.targetX - state.carX) * -0.4;
+      playerCar.rotation.y = Math.PI + (state.targetX - state.carX) * -0.15;
+
+      // invulnerability flicker
+      const invuln = performance.now() < state.invulnUntil;
+      playerCar.visible = invuln ? (Math.floor(performance.now() / 90) % 2 === 0) : true;
+
+      // move road segments
+      const travel = state.speed * dt * 60;
+      roadSegments.forEach(seg => {
+        seg.position.z += travel;
+        if (seg.position.z > SEGMENT_LEN) {
+          seg.position.z -= NUM_SEGMENTS * SEGMENT_LEN;
+        }
+      });
+
+      // move decor
+      decor.forEach(d => {
+        d.mesh.position.z += travel;
+        if (d.mesh.position.z > 12) {
+          d.mesh.position.z -= 18 * 11;
+          d.mesh.position.x = d.side * (state.roadWidth / 2 + 2.5 + Math.random() * 5);
+        }
+      });
+
+      // spawn traffic
+      state.spawnTimer += dt * 60;
+      if (state.spawnTimer >= state.spawnInterval) {
+        state.spawnTimer = 0;
+        spawnObstacle();
+      }
+
+      // move traffic
+      for (let i = traffic.length - 1; i >= 0; i--) {
+        const t = traffic[i];
+        t.mesh.position.z += travel;
+        if (!t.passed && t.mesh.position.z > playerCar.position.z + 2) {
+          t.passed = true;
+          state.score += 5;
+        }
+        if (t.mesh.position.z > 20) {
+          trafficGroup.remove(t.mesh);
+          traffic.splice(i, 1);
+        }
+      }
+
+      // score by distance
+      state.distanceSinceScore += travel;
+      state.score += travel * 0.02;
+
+      // level progression
+      if (state.score >= state.level * DIFF.scorePerLevel * 10) {
+        levelUp();
+      }
+
+      // collision check
+      if (checkCollision()) {
+        handleCrash();
+      }
+
+      // camera subtle follow
+      camera.position.x += (state.carX * 0.5 - camera.position.x) * dt * 3;
+      camera.lookAt(state.carX * 0.4, 0.5, -14);
+
+      updateHUD();
+    }
+
+    renderer.render(scene, camera);
+  }
+
+  window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+
+  // init a static road preview behind the start menu
+  resetRoad(DIFF.roadWidth);
+  resetDecor();
+  animate();
+})();
